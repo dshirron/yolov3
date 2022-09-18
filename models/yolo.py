@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
 
 from models.common import *
 from models.experimental import *
+from utils.activations import replace_activations
 from utils.autoanchor import check_anchor_order
 from utils.general import LOGGER, check_version, check_yaml, make_divisible, print_args
 from utils.plots import feature_visualization
@@ -59,6 +60,7 @@ class Detect(nn.Module):
                     self.grid[i], self.anchor_grid[i] = self._make_grid(nx, ny, i)
 
                 y = x[i].sigmoid()
+                y = y.dequantize() # dans, need to dequantize before below op as it doesnt support quantized tensors
                 if self.inplace:
                     y[..., 0:2] = (y[..., 0:2] * 2 - 0.5 + self.grid[i]) * self.stride[i]  # xy
                     y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
@@ -142,15 +144,29 @@ class Model(nn.Module):
 
     def _forward_once(self, x, profile=False, visualize=False):
         y, dt = [], []  # outputs
+        #activations_dict={'0': np.array(x.cpu())} # dans - debug keep intermediate tensors
         for m in self.model:
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
             if profile:
                 self._profile_one_layer(m, x, dt)
+            if isinstance(m,nn.modules.padding.ZeroPad2d): # Dans, since quantized pad does supports only contiguous
+                if not x.is_contiguous():
+                    x=x.contiguous()
+            if isinstance(m,Detect):
+                pass
             x = m(x)  # run
             y.append(x if m.i in self.save else None)  # save output
+            #if isinstance(x,torch.Tensor): 
+            #    activations_dict[m.i] = np.array(x.cpu()) # dans - debug keep intermediate tensors
+            #elif isinstance(x,tuple):
+            #    activations_dict[m.i] = np.array(x[0].cpu()) # dans - result of detect layer is composed of 3 tensors, i keep only 1st one
+
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
+        #import pickle
+        #with open('yolo_quant.pickle', 'wb') as handle: # dans - debug keep intermediate tensors
+        #    pickle.dump(activations_dict, handle, protocol=pickle.HIGHEST_PROTOCOL)
         return x
 
     def _descale_pred(self, p, flips, scale, img_size):
@@ -298,8 +314,14 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         if i == 0:
             ch = []
         ch.append(c2)
-    return nn.Sequential(*layers), sorted(save)
+    model = nn.Sequential(*layers)
 
+    # override all activations in model if provided in config
+    if 'act' in d:
+        LOGGER.info(f'overriding activations in model to {d["act"]}')
+        replace_activations(model, d["act"])
+
+    return model, sorted(save)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
